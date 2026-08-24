@@ -1,76 +1,105 @@
 from datetime import datetime
 from decimal import Decimal
 from typing import Dict, Any, List
+from zoneinfo import ZoneInfo
 
-async def calculate_monthly_revenue(property_id: str, month: int, year: int, db_session=None) -> Decimal:
-    """
-    Calculates revenue for a specific month.
-    """
 
-    start_date = datetime(year, month, 1)
+async def calculate_monthly_revenue(property_id: str, tenant_id: str, month: int, year: int, session) -> Dict[str, Any]:
+    """
+    Calculates revenue for a specific calendar month, bucketed by the
+    property's local timezone rather than UTC (a reservation checking in
+    late in the UTC day can fall on the next local calendar day/month).
+
+    Returns {"total": Decimal, "count": int}.
+    """
+    from sqlalchemy import text
+
+    tz_result = await session.execute(
+        text("SELECT timezone FROM properties WHERE id = :property_id AND tenant_id = :tenant_id"),
+        {"property_id": property_id, "tenant_id": tenant_id},
+    )
+    tz_name = tz_result.scalar() or "UTC"
+    tz = ZoneInfo(tz_name)
+
+    start_date = datetime(year, month, 1, tzinfo=tz)
     if month < 12:
-        end_date = datetime(year, month + 1, 1)
+        end_date = datetime(year, month + 1, 1, tzinfo=tz)
     else:
-        end_date = datetime(year + 1, 1, 1)
-        
-    print(f"DEBUG: Querying revenue for {property_id} from {start_date} to {end_date}")
+        end_date = datetime(year + 1, 1, 1, tzinfo=tz)
 
-    # SQL Simulation (This would be executed against the actual DB)
-    query = """
-        SELECT SUM(total_amount) as total
+    query = text("""
+        SELECT SUM(total_amount) as total, COUNT(*) as reservation_count
         FROM reservations
-        WHERE property_id = $1
-        AND tenant_id = $2
-        AND check_in_date >= $3
-        AND check_in_date < $4
-    """
-    
-    # In production this query executes against a database session.
-    # result = await db.fetch_val(query, property_id, tenant_id, start_date, end_date)
-    # return result or Decimal('0')
-    
-    return Decimal('0') # Placeholder for now until DB connection is finalized
+        WHERE property_id = :property_id
+        AND tenant_id = :tenant_id
+        AND check_in_date >= :start_date
+        AND check_in_date < :end_date
+    """)
 
-async def calculate_total_revenue(property_id: str, tenant_id: str) -> Dict[str, Any]:
+    result = await session.execute(
+        query,
+        {
+            "property_id": property_id,
+            "tenant_id": tenant_id,
+            "start_date": start_date,
+            "end_date": end_date,
+        },
+    )
+    row = result.fetchone()
+    total = Decimal(str(row.total)) if row and row.total is not None else Decimal('0')
+    count = row.reservation_count if row else 0
+    return {"total": total, "count": count}
+
+
+async def calculate_total_revenue(property_id: str, tenant_id: str, month: int = None, year: int = None) -> Dict[str, Any]:
     """
-    Aggregates revenue from database.
+    Aggregates revenue from database, optionally scoped to a calendar month.
     """
     try:
-        # Import database pool
-        from app.core.database_pool import DatabasePool
-        
-        # Initialize pool if needed
-        db_pool = DatabasePool()
-        await db_pool.initialize()
-        
+        from app.core.database_pool import db_pool
+
+        if not db_pool.session_factory:
+            await db_pool.initialize()
+
         if db_pool.session_factory:
             async with db_pool.get_session() as session:
                 # Use SQLAlchemy text for raw SQL
                 from sqlalchemy import text
-                
+
+                if month is not None and year is not None:
+                    monthly = await calculate_monthly_revenue(property_id, tenant_id, month, year, session)
+
+                    return {
+                        "property_id": property_id,
+                        "tenant_id": tenant_id,
+                        "total": str(monthly["total"]),
+                        "currency": "USD",
+                        "count": monthly["count"],
+                    }
+
                 query = text("""
-                    SELECT 
+                    SELECT
                         property_id,
                         SUM(total_amount) as total_revenue,
                         COUNT(*) as reservation_count
-                    FROM reservations 
+                    FROM reservations
                     WHERE property_id = :property_id AND tenant_id = :tenant_id
                     GROUP BY property_id
                 """)
-                
+
                 result = await session.execute(query, {
-                    "property_id": property_id, 
+                    "property_id": property_id,
                     "tenant_id": tenant_id
                 })
                 row = result.fetchone()
-                
+
                 if row:
                     total_revenue = Decimal(str(row.total_revenue))
                     return {
                         "property_id": property_id,
                         "tenant_id": tenant_id,
                         "total": str(total_revenue),
-                        "currency": "USD", 
+                        "currency": "USD",
                         "count": row.reservation_count
                     }
                 else:
